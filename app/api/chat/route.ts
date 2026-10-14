@@ -1,4 +1,10 @@
+
 import { llm } from "../../../lib/llm";
+
+type HistoryMessage = {
+  role: "user" | "assistant";
+  text: string;
+};
 
 export async function POST(request: Request) {
   let body: unknown;
@@ -25,6 +31,30 @@ export async function POST(request: Request) {
     );
   }
 
+  let history: HistoryMessage[] = [];
+
+  if ("history" in body && body.history !== undefined) {
+    if (
+      !Array.isArray(body.history) ||
+      !body.history.every(
+        (item) =>
+          typeof item === "object" &&
+          item !== null &&
+          "role" in item &&
+          (item.role === "user" || item.role === "assistant") &&
+          "text" in item &&
+          typeof item.text === "string"
+      )
+    ) {
+      return Response.json(
+        { error: "Invalid conversation history." },
+        { status: 400 }
+      );
+    }
+
+    history = body.history;
+  }
+
   try {
     const completion = await llm.chat.completions.create({
       model: process.env.LLM_MODEL!,
@@ -33,6 +63,10 @@ export async function POST(request: Request) {
           role: "system",
           content: "You are a helpful assistant. Answer clearly and concisely.",
         },
+        ...history.map((item) => ({
+          role: item.role,
+          content: item.text,
+        })),
         {
           role: "user",
           content: body.message,

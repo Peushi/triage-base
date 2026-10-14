@@ -1,8 +1,10 @@
+
 import OpenAI from "openai";
 
-const openai = new OpenAI({
+export const llm = new OpenAI({
   baseURL: process.env.LLM_BASE_URL,
-  apiKey: process.env.LLM_API_KEY
-}); 
+  apiKey: process.env.LLM_API_KEY,
+});
 
-export const llm = openai;
+export const STRUCTURED_OUTPUT_MODE =
+  process.env.LLM_STRUCTURED_OUTPUT ?? "prompt";
