@@ -13,10 +13,7 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return Response.json(
-      { error: "Invalid JSON body." },
-      { status: 400 }
-    );
+    return Response.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
   if (
@@ -28,7 +25,7 @@ export async function POST(request: Request) {
   ) {
     return Response.json(
       { error: "Please provide a non-empty ticket string." },
-      { status: 400 }
+      { status: 400 },
     );
   }
 
@@ -38,19 +35,21 @@ export async function POST(request: Request) {
   ) {
     return Response.json(
       { error: "Invalid structured output configuration." },
-      { status: 500 }
+      { status: 500 },
     );
   }
 
   try {
-    const messages = [
-      { role: "system" as const, content: TRIAGE_SYSTEM_PROMPT },
-      { role: "user" as const, content: buildTriageUserPrompt(body.ticket) },
-    ];
+    const startTime = performance.now();
 
     const completion = await llm.chat.completions.create({
       model: process.env.LLM_MODEL!,
-      messages,
+      max_tokens: 300,
+      reasoning_effort: "low",
+      messages: [
+        { role: "system", content: TRIAGE_SYSTEM_PROMPT },
+        { role: "user", content: buildTriageUserPrompt(body.ticket) },
+      ],
       ...(STRUCTURED_OUTPUT_MODE === "json_schema"
         ? {
             response_format: {
@@ -91,12 +90,13 @@ export async function POST(request: Request) {
         : {}),
     });
 
+    const latencyMs = Math.round(performance.now() - startTime);
     const raw = completion.choices[0]?.message?.content;
 
     if (!raw) {
       return Response.json(
         { error: "The AI returned an empty response." },
-        { status: 502 }
+        { status: 502 },
       );
     }
 
@@ -107,7 +107,7 @@ export async function POST(request: Request) {
     } catch {
       return Response.json(
         { error: "The AI returned invalid JSON." },
-        { status: 502 }
+        { status: 502 },
       );
     }
 
@@ -115,22 +115,29 @@ export async function POST(request: Request) {
 
     if (!validation.success) {
       console.error("Triage validation failed:", validation.error.issues);
-
       return Response.json(
         { error: "The AI response did not match the triage schema." },
-        { status: 502 }
+        { status: 502 },
       );
     }
 
     console.log(`Triage prompt version: ${PROMPT_VERSION}`);
 
-    return Response.json(validation.data);
+    return Response.json({
+      ...validation.data,
+      usage: {
+        inputTokens: completion.usage?.prompt_tokens ?? 0,
+        outputTokens: completion.usage?.completion_tokens ?? 0,
+        totalTokens: completion.usage?.total_tokens ?? 0,
+      },
+      latencyMs,
+      model: process.env.LLM_MODEL,
+    });
   } catch (error) {
     console.error("Triage LLM API error:", error);
-
     return Response.json(
       { error: "Failed to triage the support ticket." },
-      { status: 502 }
+      { status: 502 },
     );
   }
 }
