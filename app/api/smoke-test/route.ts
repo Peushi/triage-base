@@ -1,8 +1,9 @@
 
 import { readFile } from "node:fs/promises";
 import path from "node:path";
-import { randomInt } from "node:crypto";
+import { randomInt, randomUUID } from "node:crypto";
 import { TriageSchema } from "../../../lib/schema";
+import { saveSmokeRun } from "../../../lib/smoke-test-history";
 
 type Dataset = "labelled" | "unlabelled";
 
@@ -15,12 +16,14 @@ type Ticket = {
 };
 
 function mockPrediction(ticket: Ticket) {
-  // Placeholder predictions for testing the smoke test runner.
-  // These are NOT real model predictions.
   const subject = ticket.subject?.trim() ?? "";
   const text = `${subject} ${ticket.body ?? ""}`.toLowerCase();
 
-  let category: "billing" | "technical_bug" | "account" | "feature_request";
+  let category:
+    | "billing"
+    | "technical_bug"
+    | "account"
+    | "feature_request";
   let priority: "low" | "medium" | "high";
 
   if (/refund|invoice|charged|billing|payment/.test(text)) {
@@ -73,10 +76,7 @@ export async function POST(request: Request) {
     body.sampleSize > 500
   ) {
     return Response.json(
-      {
-        error:
-          "Choose a valid dataset and a sample size between 1 and 500.",
-      },
+      { error: "Choose a valid dataset and a sample size between 1 and 500." },
       { status: 400 },
     );
   }
@@ -101,14 +101,11 @@ export async function POST(request: Request) {
 
     if (body.sampleSize > tickets.length) {
       return Response.json(
-        {
-          error: `This dataset contains only ${tickets.length} tickets.`,
-        },
+        { error: `This dataset contains only ${tickets.length} tickets.` },
         { status: 400 },
       );
     }
 
-    // Select a random sample without replacement.
     const remaining = [...tickets];
     const sample: Ticket[] = [];
 
@@ -163,28 +160,74 @@ export async function POST(request: Request) {
       (result) => result.priorityMatch === true,
     ).length;
 
+    const categoryCounts = {
+      billing: 0,
+      technical_bug: 0,
+      account: 0,
+      feature_request: 0,
+    };
+
+    const priorityCounts = { low: 0, medium: 0, high: 0 };
+
+    for (const result of results) {
+      categoryCounts[result.prediction.category]++;
+      priorityCounts[result.prediction.priority]++;
+    }
+
+    const accuracy = {
+      category:
+        labelledResults.length > 0
+          ? categoryCorrect / labelledResults.length
+          : null,
+      priority:
+        labelledResults.length > 0
+          ? priorityCorrect / labelledResults.length
+          : null,
+    };
+
+    const run = {
+      runId: randomUUID(),
+      createdAt: new Date().toISOString(),
+      dataset,
+      sampleSize: results.length,
+      categoryAccuracy: accuracy.category,
+      priorityAccuracy: accuracy.priority,
+      categoryMismatches:
+        labelledResults.length > 0
+          ? labelledResults.length - categoryCorrect
+          : null,
+      priorityMismatches:
+        labelledResults.length > 0
+          ? labelledResults.length - priorityCorrect
+          : null,
+      categoryCounts,
+      priorityCounts,
+      averageLatencyMs: 0,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      totalTokens: 0,
+      estimatedCostUsd: null,
+      model: "mock-rule-based",
+      strategy: "mock" as const,
+      mode: "mock" as const,
+    };
+
+    await saveSmokeRun(run);
+
     return Response.json({
       mode: "mock",
       dataset,
       sampleSize: results.length,
-      accuracy: {
-        category:
-          labelledResults.length > 0
-            ? categoryCorrect / labelledResults.length
-            : null,
-        priority:
-          labelledResults.length > 0
-            ? priorityCorrect / labelledResults.length
-            : null,
-      },
+      accuracy,
       results,
+      runId: run.runId,
       note: "Mock predictions only. These are not real model accuracy results.",
     });
   } catch (error) {
     console.error("Smoke test failed:", error);
 
     return Response.json(
-      { error: "Could not load or process the smoke test dataset." },
+      { error: "Could not load, process, or save the smoke test run." },
       { status: 500 },
     );
   }
