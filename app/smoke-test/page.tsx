@@ -1,9 +1,9 @@
-
 "use client";
 
 import { useState, type FormEvent } from "react";
 
 type Dataset = "labelled" | "unlabelled";
+type Strategy = "llm" | "dm" | "dm+llm";
 
 type Prediction = {
   category: string;
@@ -32,6 +32,8 @@ type TestResult = {
 
 type SmokeTestResponse = {
   mode: string;
+  strategy?: Strategy;
+  model?: string;
   dataset: Dataset;
   sampleSize: number;
   accuracy: {
@@ -40,10 +42,12 @@ type SmokeTestResponse = {
   };
   results: TestResult[];
   note: string;
+  runId?: string;
 };
 
 export default function SmokeTestPage() {
   const [dataset, setDataset] = useState<Dataset>("labelled");
+  const [strategy, setStrategy] = useState<Strategy>("dm");
   const [sampleSize, setSampleSize] = useState("5");
   const [result, setResult] = useState<SmokeTestResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -75,6 +79,7 @@ export default function SmokeTestPage() {
         body: JSON.stringify({
           dataset,
           sampleSize: size,
+          strategy,
         }),
       });
 
@@ -88,6 +93,7 @@ export default function SmokeTestPage() {
           typeof data.error === "string"
             ? data.error
             : "The smoke test failed.";
+
         throw new Error(message);
       }
 
@@ -146,7 +152,7 @@ export default function SmokeTestPage() {
         <h1>Smoke Test Runner</h1>
         <p>
           Evaluate support-ticket classification using a random sample from
-          your datasets.
+          your datasets and compare the available decision strategies.
         </p>
       </header>
 
@@ -176,6 +182,28 @@ export default function SmokeTestPage() {
           </div>
 
           <div className="field">
+            <label htmlFor="strategy">Evaluation strategy</label>
+            <select
+              id="strategy"
+              value={strategy}
+              onChange={(event) => {
+                setStrategy(event.target.value as Strategy);
+                setResult(null);
+                setError(null);
+              }}
+              disabled={isRunning}
+            >
+              <option value="llm">LLM — NVIDIA</option>
+              <option value="dm">DM — Decision 3.0</option>
+              <option value="dm+llm">DM + LLM — combined</option>
+            </select>
+            <small>
+              LLM generates the full response; DM classifies category and
+              priority; the combined strategy uses both.
+            </small>
+          </div>
+
+          <div className="field">
             <label htmlFor="sampleSize">Random sample size</label>
             <input
               id="sampleSize"
@@ -196,7 +224,11 @@ export default function SmokeTestPage() {
             {isRunning ? "Running test..." : "Run smoke test"}
           </button>
 
-          {error && <p className="error-message" role="alert">{error}</p>}
+          {error && (
+            <p className="error-message" role="alert">
+              {error}
+            </p>
+          )}
         </form>
       </section>
 
@@ -204,6 +236,9 @@ export default function SmokeTestPage() {
         <>
           <section className="notice" aria-live="polite">
             <strong>Mode: {result.mode.toUpperCase()}</strong>
+            <p>Strategy: {result.strategy ?? strategy}</p>
+            {result.model && <p>Model: {result.model}</p>}
+            {result.runId && <p>Run ID: {result.runId}</p>}
             <p>{result.note}</p>
           </section>
 
@@ -212,14 +247,17 @@ export default function SmokeTestPage() {
               <span>Tickets tested</span>
               <strong>{result.sampleSize}</strong>
             </article>
+
             <article className="metric-card">
               <span>Category accuracy</span>
               <strong>{formatAccuracy(result.accuracy.category)}</strong>
             </article>
+
             <article className="metric-card">
               <span>Priority accuracy</span>
               <strong>{formatAccuracy(result.accuracy.priority)}</strong>
             </article>
+
             <article className="metric-card">
               <span>Total reported tokens</span>
               <strong>{totalTokens}</strong>
@@ -231,10 +269,12 @@ export default function SmokeTestPage() {
               <h2>Mismatch summary</h2>
               <div className="mismatch-grid">
                 <p>
-                  Category mismatches: <strong>{categoryMismatches}</strong>
+                  Category mismatches:{" "}
+                  <strong>{categoryMismatches}</strong>
                 </p>
                 <p>
-                  Priority mismatches: <strong>{priorityMismatches}</strong>
+                  Priority mismatches:{" "}
+                  <strong>{priorityMismatches}</strong>
                 </p>
               </div>
             </section>
@@ -258,6 +298,8 @@ export default function SmokeTestPage() {
                     <th>Predicted priority</th>
                     <th>Expected priority</th>
                     <th>Result</th>
+                    <th>Latency (ms)</th>
+                    <th>Tokens</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -278,6 +320,8 @@ export default function SmokeTestPage() {
                           <span className="status-bad">Mismatch</span>
                         )}
                       </td>
+                      <td>{item.latencyMs}</td>
+                      <td>{item.usage.totalTokens}</td>
                     </tr>
                   ))}
                 </tbody>

@@ -2,10 +2,21 @@
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { randomInt, randomUUID } from "node:crypto";
-import { TriageSchema } from "../../../lib/schema";
-import { saveSmokeRun } from "../../../lib/smoke-test-history";
+import { TriageSchema, type TriageResult } from "../../../lib/schema";
+import {
+  PROMPT_VERSION,
+  TRIAGE_SYSTEM_PROMPT,
+  buildTriageUserPrompt,
+} from "../../../lib/prompt";
+import { STRUCTURED_OUTPUT_MODE, llm } from "../../../lib/llm";
+import { classifyWithDecisionModel } from "../../../lib/decision-model";
+import {
+  saveSmokeRun,
+  type SmokeRun,
+} from "../../../lib/smoke-test-history";
 
 type Dataset = "labelled" | "unlabelled";
+type Strategy = "llm" | "dm" | "dm+llm";
 
 type Ticket = {
   ticket_id: string;
@@ -15,43 +26,161 @@ type Ticket = {
   priority?: string;
 };
 
-function mockPrediction(ticket: Ticket) {
-  const subject = ticket.subject?.trim() ?? "";
-  const text = `${subject} ${ticket.body ?? ""}`.toLowerCase();
+type TestResult = {
+  ticketId: string;
+  subject: string;
+  prediction: TriageResult;
+  expected: {
+    category: string;
+    priority: string;
+  } | null;
+  categoryMatch: boolean | null;
+  priorityMatch: boolean | null;
+  latencyMs: number;
+  usage: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+};
 
-  let category:
-    | "billing"
-    | "technical_bug"
-    | "account"
-    | "feature_request";
-  let priority: "low" | "medium" | "high";
+function redactSensitiveText(text: string): string {
+  return text
+    .replace(
+      /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi,
+      "[REDACTED_EMAIL]",
+    )
+    .replace(
+      /\b(?:\+?\d[\d ().-]{7,}\d)\b/g,
+      "[REDACTED_PHONE]",
+    )
+    .replace(
+      /\b(?:sk-vsr-|nvapi-)[A-Za-z0-9_-]+\b/g,
+      "[REDACTED_KEY]",
+    )
+    .replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]");
+}
 
-  if (/refund|invoice|charged|billing|payment/.test(text)) {
-    category = "billing";
-    priority = "medium";
-  } else if (/password|login|account|sign in/.test(text)) {
-    category = "account";
-    priority = "medium";
-  } else if (/feature|would like|please add|suggestion/.test(text)) {
-    category = "feature_request";
-    priority = "low";
-  } else {
-    category = "technical_bug";
-    priority = "low";
+async function predictWithLlm(ticketText: string): Promise<{
+  prediction: TriageResult;
+  model: string;
+  latencyMs: number;
+  inputTokens: number;
+  outputTokens: number;
+}> {
+  const start = performance.now();
+
+  const model = process.env.LLM_MODEL;
+
+  if (!model) {
+    throw new Error("LLM_MODEL is missing from .env.local.");
   }
 
+  const completion = await llm.chat.completions.create({
+    model,
+    max_tokens: 300,
+    reasoning_effort: "low",
+    messages: [
+      { role: "system", content: TRIAGE_SYSTEM_PROMPT },
+      { role: "user", content: buildTriageUserPrompt(ticketText) },
+    ],
+    ...(STRUCTURED_OUTPUT_MODE === "json_schema"
+      ? {
+          response_format: {
+            type: "json_schema" as const,
+            json_schema: {
+              name: "support_triage",
+              strict: true,
+              schema: {
+                type: "object",
+                properties: {
+                  category: {
+                    type: "string",
+                    enum: [
+                      "billing",
+                      "technical_bug",
+                      "account",
+                      "feature_request",
+                    ],
+                  },
+                  priority: {
+                    type: "string",
+                    enum: ["low", "medium", "high"],
+                  },
+                  summary: { type: "string" },
+                  suggested_action: { type: "string" },
+                },
+                required: [
+                  "category",
+                  "priority",
+                  "summary",
+                  "suggested_action",
+                ],
+                additionalProperties: false,
+              },
+            },
+          },
+        }
+      : {}),
+  });
+
+  const latencyMs = Math.round(performance.now() - start);
+  const raw = completion.choices[0]?.message?.content;
+
+  if (!raw) {
+    throw new Error("The LLM returned an empty response.");
+  }
+
+  let parsed: unknown;
+
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("The LLM returned invalid JSON.");
+  }
+
+  const validation = TriageSchema.safeParse(parsed);
+
+  if (!validation.success) {
+    throw new Error("The LLM response did not match the triage schema.");
+  }
+
+  console.log(`Triage prompt version: ${PROMPT_VERSION}`);
+
   return {
-    category,
-    priority,
-    summary: subject || "Support ticket requiring review",
-    suggested_action:
-      category === "billing"
-        ? "Review the customer's billing details."
-        : category === "account"
-          ? "Review the customer's account issue."
-          : category === "feature_request"
-            ? "Review the feature request."
-            : "Investigate the reported issue.",
+    prediction: validation.data,
+    model,
+    latencyMs,
+    inputTokens: completion.usage?.prompt_tokens ?? 0,
+    outputTokens: completion.usage?.completion_tokens ?? 0,
+  };
+}
+
+function makeDmSummary(
+  category: TriageResult["category"],
+  subject: string,
+): Pick<TriageResult, "summary" | "suggested_action"> {
+  const summaries = {
+    billing: "The ticket concerns a billing or payment issue.",
+    technical_bug: "The ticket reports a technical problem.",
+    account: "The ticket concerns an account or access issue.",
+    feature_request: "The ticket requests a feature or product improvement.",
+  };
+
+  const actions = {
+    billing:
+      "Review the billing records and investigate the reported payment issue.",
+    technical_bug:
+      "Reproduce the issue, inspect relevant logs, and investigate a fix.",
+    account:
+      "Verify the account securely and investigate the access issue.",
+    feature_request:
+      "Record the request and evaluate it against product priorities.",
+  };
+
+  return {
+    summary: subject.trim() || summaries[category],
+    suggested_action: actions[category],
   };
 }
 
@@ -61,27 +190,67 @@ export async function POST(request: Request) {
   try {
     body = await request.json();
   } catch {
-    return Response.json({ error: "Invalid JSON body." }, { status: 400 });
-  }
-
-  if (
-    typeof body !== "object" ||
-    body === null ||
-    !("dataset" in body) ||
-    (body.dataset !== "labelled" && body.dataset !== "unlabelled") ||
-    !("sampleSize" in body) ||
-    typeof body.sampleSize !== "number" ||
-    !Number.isInteger(body.sampleSize) ||
-    body.sampleSize < 1 ||
-    body.sampleSize > 500
-  ) {
     return Response.json(
-      { error: "Choose a valid dataset and a sample size between 1 and 500." },
+      { error: "Invalid JSON body." },
       { status: 400 },
     );
   }
 
-  const dataset = body.dataset as Dataset;
+  if (typeof body !== "object" || body === null) {
+    return Response.json(
+      { error: "Request body must be an object." },
+      { status: 400 },
+    );
+  }
+
+  const input = body as Record<string, unknown>;
+  const datasetInput = input.dataset;
+  const strategyInput = input.strategy ?? "dm";
+  const sampleSizeInput = input.sampleSize;
+
+  if (
+    datasetInput !== "labelled" &&
+    datasetInput !== "unlabelled"
+  ) {
+    return Response.json(
+      { error: "Choose a valid dataset." },
+      { status: 400 },
+    );
+  }
+
+  const dataset: Dataset = datasetInput;
+
+  if (
+    strategyInput !== "llm" &&
+    strategyInput !== "dm" &&
+    strategyInput !== "dm+llm"
+  ) {
+    return Response.json(
+      { error: "Choose llm, dm, or dm+llm strategy." },
+      { status: 400 },
+    );
+  }
+
+  const strategy: Strategy = strategyInput;
+
+  if (
+    typeof sampleSizeInput !== "number" ||
+    !Number.isInteger(sampleSizeInput) ||
+    sampleSizeInput < 1 ||
+    sampleSizeInput > (dataset === "labelled" ? 100 : 500)
+  ) {
+    return Response.json(
+      {
+        error: `Sample size must be between 1 and ${
+          dataset === "labelled" ? 100 : 500
+        } for this dataset.`,
+      },
+      { status: 400 },
+    );
+  }
+
+  const sampleSize = sampleSizeInput;
+
   const filename =
     dataset === "labelled"
       ? "support_tickets_100_labelled.json"
@@ -89,48 +258,113 @@ export async function POST(request: Request) {
 
   try {
     const filePath = path.join(process.cwd(), "data", filename);
-    const file = await readFile(filePath, "utf8");
-    const tickets = JSON.parse(file) as Ticket[];
+    const parsedTickets: unknown = JSON.parse(
+      await readFile(filePath, "utf8"),
+    );
 
-    if (!Array.isArray(tickets)) {
+    if (!Array.isArray(parsedTickets)) {
       return Response.json(
-        { error: "The selected dataset has an invalid format." },
-        { status: 500 },
-      );
-    }
-
-    if (body.sampleSize > tickets.length) {
-      return Response.json(
-        { error: `This dataset contains only ${tickets.length} tickets.` },
+        { error: "The selected dataset is not a valid array." },
         { status: 400 },
       );
     }
 
+    const tickets = parsedTickets as Ticket[];
+
+    if (sampleSize > tickets.length) {
+      return Response.json(
+        { error: "The selected dataset is invalid or too small." },
+        { status: 400 },
+      );
+    }
+
+    // Select a random sample without replacement.
     const remaining = [...tickets];
     const sample: Ticket[] = [];
 
-    for (let i = 0; i < body.sampleSize; i++) {
+    for (let i = 0; i < sampleSize; i++) {
       const index = randomInt(remaining.length);
       sample.push(remaining[index]);
       remaining.splice(index, 1);
     }
 
-    const results = sample.map((ticket) => {
-      const prediction = TriageSchema.parse(mockPrediction(ticket));
+    const results: TestResult[] = [];
+
+    let actualModel =
+      strategy === "dm"
+        ? "vllm-sr/d3-flash"
+        : process.env.LLM_MODEL ?? "unknown-llm";
+
+    for (const ticket of sample) {
+      const subject = ticket.subject?.trim() ?? "";
+
+      const ticketText = redactSensitiveText(
+        `Subject: ${subject}\nTicket: ${ticket.body ?? ""}`,
+      );
+
+      const start = performance.now();
+
+      let prediction: TriageResult;
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let latencyMs = 0;
+
+      if (strategy === "llm") {
+        const llmResult = await predictWithLlm(ticketText);
+
+        prediction = llmResult.prediction;
+        inputTokens = llmResult.inputTokens;
+        outputTokens = llmResult.outputTokens;
+        latencyMs = llmResult.latencyMs;
+        actualModel = llmResult.model;
+      } else {
+        const dmResult = await classifyWithDecisionModel(ticketText);
+
+        inputTokens += dmResult.inputTokens;
+        outputTokens += dmResult.outputTokens;
+        latencyMs += dmResult.latencyMs;
+        actualModel = dmResult.model;
+
+        if (strategy === "dm+llm") {
+          const llmResult = await predictWithLlm(ticketText);
+
+          inputTokens += llmResult.inputTokens;
+          outputTokens += llmResult.outputTokens;
+          latencyMs += llmResult.latencyMs;
+
+          prediction = {
+            ...llmResult.prediction,
+            category: dmResult.category,
+            priority: dmResult.priority,
+          };
+
+          actualModel = `${dmResult.model} + ${llmResult.model}`;
+        } else {
+          prediction = {
+            category: dmResult.category,
+            priority: dmResult.priority,
+            ...makeDmSummary(dmResult.category, subject),
+          };
+        }
+      }
+
+      if (latencyMs === 0) {
+        latencyMs = Math.round(performance.now() - start);
+      }
 
       const isLabelled =
         dataset === "labelled" &&
         typeof ticket.category === "string" &&
         typeof ticket.priority === "string";
 
-      return {
+      results.push({
         ticketId: ticket.ticket_id,
-        subject: ticket.subject?.trim() || "Untitled support ticket",
-        prediction,
+        subject: subject || "Untitled support ticket",
+        prediction: TriageSchema.parse(prediction),
         expected: isLabelled
           ? {
-              category: ticket.category,
-              priority: ticket.priority,
+              category: ticket.category!,
+              priority: ticket.priority!,
             }
           : null,
         categoryMatch: isLabelled
@@ -139,14 +373,14 @@ export async function POST(request: Request) {
         priorityMatch: isLabelled
           ? prediction.priority === ticket.priority
           : null,
-        latencyMs: 0,
+        latencyMs,
         usage: {
-          inputTokens: 0,
-          outputTokens: 0,
-          totalTokens: 0,
+          inputTokens,
+          outputTokens,
+          totalTokens: inputTokens + outputTokens,
         },
-      };
-    });
+      });
+    }
 
     const labelledResults = results.filter(
       (result) => result.expected !== null,
@@ -160,6 +394,15 @@ export async function POST(request: Request) {
       (result) => result.priorityMatch === true,
     ).length;
 
+    const accuracy = {
+      category: labelledResults.length
+        ? categoryCorrect / labelledResults.length
+        : null,
+      priority: labelledResults.length
+        ? priorityCorrect / labelledResults.length
+        : null,
+    };
+
     const categoryCounts = {
       billing: 0,
       technical_bug: 0,
@@ -167,68 +410,84 @@ export async function POST(request: Request) {
       feature_request: 0,
     };
 
-    const priorityCounts = { low: 0, medium: 0, high: 0 };
+    const priorityCounts = {
+      low: 0,
+      medium: 0,
+      high: 0,
+    };
 
     for (const result of results) {
       categoryCounts[result.prediction.category]++;
       priorityCounts[result.prediction.priority]++;
     }
 
-    const accuracy = {
-      category:
-        labelledResults.length > 0
-          ? categoryCorrect / labelledResults.length
-          : null,
-      priority:
-        labelledResults.length > 0
-          ? priorityCorrect / labelledResults.length
-          : null,
-    };
+    const totalInputTokens = results.reduce(
+      (sum, result) => sum + result.usage.inputTokens,
+      0,
+    );
 
-    const run = {
+    const totalOutputTokens = results.reduce(
+      (sum, result) => sum + result.usage.outputTokens,
+      0,
+    );
+
+    const averageLatencyMs = Math.round(
+      results.reduce((sum, result) => sum + result.latencyMs, 0) /
+        results.length,
+    );
+
+    const run: SmokeRun = {
       runId: randomUUID(),
       createdAt: new Date().toISOString(),
       dataset,
       sampleSize: results.length,
       categoryAccuracy: accuracy.category,
       priorityAccuracy: accuracy.priority,
-      categoryMismatches:
-        labelledResults.length > 0
-          ? labelledResults.length - categoryCorrect
-          : null,
-      priorityMismatches:
-        labelledResults.length > 0
-          ? labelledResults.length - priorityCorrect
-          : null,
+      categoryMismatches: labelledResults.length
+        ? labelledResults.length - categoryCorrect
+        : null,
+      priorityMismatches: labelledResults.length
+        ? labelledResults.length - priorityCorrect
+        : null,
       categoryCounts,
       priorityCounts,
-      averageLatencyMs: 0,
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
-      totalTokens: 0,
+      averageLatencyMs,
+      totalInputTokens,
+      totalOutputTokens,
+      totalTokens: totalInputTokens + totalOutputTokens,
       estimatedCostUsd: null,
-      model: "mock-rule-based",
-      strategy: "mock" as const,
-      mode: "mock" as const,
+      model: actualModel,
+      strategy,
+      mode: "live",
     };
 
     await saveSmokeRun(run);
 
     return Response.json({
-      mode: "mock",
+      mode: "live",
+      strategy,
+      model: actualModel,
       dataset,
       sampleSize: results.length,
       accuracy,
       results,
       runId: run.runId,
-      note: "Mock predictions only. These are not real model accuracy results.",
+      note:
+        strategy === "dm"
+          ? "Decision 3.0 supplied category and priority; summary and action are deterministic templates."
+          : strategy === "dm+llm"
+            ? "Decision 3.0 supplied category and priority; the LLM supplied the summary and suggested action."
+            : "The NVIDIA LLM supplied the full triage prediction.",
     });
   } catch (error) {
     console.error("Smoke test failed:", error);
 
+    const message =
+      error instanceof Error ? error.message : "Unknown error.";
+
     return Response.json(
-      { error: "Could not load, process, or save the smoke test run." },
-      { status: 500 },
+      { error: `Smoke test failed: ${message}` },
+      { status: 502 },
     );
   }
 }
